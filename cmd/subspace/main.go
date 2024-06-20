@@ -390,9 +390,6 @@ func configureSAML() error {
 		Certificate:       keyPair.Leaf,
 		IDPMetadata:       entity,
 		CookieName:        SessionCookieNameSSO,
-		CookieDomain:      httpHost, // TODO: this will break if using a custom domain.
-		CookieSecure:      !httpInsecure,
-		Logger:            logger,
 		AllowIDPInitiated: true,
 	})
 	if err != nil {
