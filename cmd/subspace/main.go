@@ -6,9 +6,11 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/xml"
 	"flag"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -96,6 +98,45 @@ func init() {
 	cli.BoolVar(&showHelp, "help", false, "display help and exit")
 	cli.BoolVar(&debug, "debug", false, "debug mode")
 	cli.StringVar(&semanticTheme, "theme", "green", "Semantic-ui theme to use")
+}
+
+// GenX509KeyPair generates the TLS keypair for the server
+func GenX509KeyPair(serverName string) (tls.Certificate, error) {
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(now.Unix()),
+		Subject: pkix.Name{
+			CommonName:         serverName,
+			Country:            []string{"UA"},
+			Organization:       []string{serverName},
+			OrganizationalUnit: []string{serverName},
+		},
+		NotBefore:             now,
+		NotAfter:              now.AddDate(1, 2, 3),
+		SubjectKeyId:          []byte{113, 117, 105, 99, 107, 115, 101, 114, 118, 101},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		KeyUsage: x509.KeyUsageKeyEncipherment |
+			x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+	}
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	cert, err := x509.CreateCertificate(rand.Reader, template, template,
+		priv.Public(), priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	var outCert tls.Certificate
+	outCert.Certificate = append(outCert.Certificate, cert)
+	outCert.PrivateKey = priv
+
+	return outCert, nil
 }
 
 func main() {
@@ -215,7 +256,7 @@ func main() {
 	if !letsencrypt {
 		httpd := &http.Server{
 			Handler:        r,
-			Addr:           net.JoinHostPort(httpIP, httpPort),
+			Addr:           httpAddr,
 			WriteTimeout:   httpTimeout,
 			ReadTimeout:    httpTimeout,
 			MaxHeaderBytes: maxHeaderBytes,
@@ -271,8 +312,19 @@ func main() {
 		}
 	}()
 
+	var certs []tls.Certificate
+	if !letsencrypt {
+		logger.Infof("Generating self-signed TLS certificate for %s\n", httpHost)
+		cert, err := GenX509KeyPair(httpHost)
+		if err != nil {
+			logger.Fatalf("failed to generate TLS keypair: %s", err)
+		}
+		certs = append(certs, cert)
+	}
+
 	// TLS
 	tlsConfig := tls.Config{
+		Certificates:             certs,
 		GetCertificate:           certmanager.GetCertificate,
 		NextProtos:               []string{"http/1.1"},
 		Rand:                     rand.Reader,

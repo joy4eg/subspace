@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"image/png"
-	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -22,7 +22,6 @@ var (
 	validEmail    = regexp.MustCompile(`^[ -~]+@[ -~]+$`)
 	validPassword = regexp.MustCompile(`^[ -~]{6,200}$`)
 	validString   = regexp.MustCompile(`^[ -~]{1,200}$`)
-	maxProfiles   = 250
 )
 
 func getEnv(key, fallback string) string {
@@ -47,7 +46,6 @@ func ssoHandler(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 
 	logger.Debugf("SSO: unable to get session")
 	samlSP.OnError(w, r, err)
-	return
 }
 
 // Handles the SAML part separately from sign in
@@ -72,7 +70,7 @@ func wireguardQRConfigHandler(w *Web) {
 		return
 	}
 
-	b, err := ioutil.ReadFile(profile.WireGuardConfigPath())
+	b, err := os.ReadFile(profile.WireGuardConfigPath())
 	if err != nil {
 		Error(w.w, err)
 		return
@@ -103,7 +101,7 @@ func wireguardConfigHandler(w *Web) {
 		return
 	}
 
-	b, err := ioutil.ReadFile(profile.WireGuardConfigPath())
+	b, err := os.ReadFile(profile.WireGuardConfigPath())
 	if err != nil {
 		Error(w.w, err)
 		return
@@ -377,6 +375,8 @@ func userDeleteHandler(w *Web) {
 }
 
 func profileAddHandler(w *Web) {
+	var err error
+
 	if !w.Admin && w.User.ID == "" {
 		http.NotFound(w.w, w.r)
 		return
@@ -400,18 +400,6 @@ func profileAddHandler(w *Web) {
 		userID = ""
 	} else {
 		userID = w.User.ID
-	}
-
-	if len(config.ListProfiles()) >= maxProfiles {
-		w.Redirect("/?error=addprofile")
-		return
-	}
-
-	profile, err := config.AddProfile(userID, name, platform)
-	if err != nil {
-		logger.Warn(err)
-		w.Redirect("/?error=addprofile")
-		return
 	}
 
 	ipv4Pref := "10.99.97."
@@ -467,17 +455,79 @@ func profileAddHandler(w *Web) {
 		persistentKeepalive = keepalive
 	}
 
+	var ipv4subnet *net.IPNet
+	if ipv4Enabled {
+		_, ipv4subnet, err = net.ParseCIDR(fmt.Sprintf("%s0/%s", ipv4Pref, ipv4Cidr))
+		if err != nil {
+			logger.Errorf("cannot parse CIDR: %v", err)
+			w.Redirect("/?error=addprofile")
+			return
+		}
+
+		m := hostsMax4(ipv4subnet) - 1 // -1 for the gateway.
+		if len(config.ListProfiles()) > int(m) {
+			logger.Errorf("cannot add profile: no more available IPv4 addresses in subnet %v", ipv4subnet)
+			w.Redirect("/?error=addprofile")
+			return
+		}
+	}
+
+	profile, err := config.AddProfile(userID, name, platform)
+	if err != nil {
+		logger.Warnf("add profile failed: %s", err)
+		w.Redirect("/?error=addprofile")
+		return
+	}
+
+	var ipv4Addr string
+	if ipv4Enabled {
+		v4, _, err := generateIPAddr(ipv4subnet, nil, uint32(profile.Number))
+		if err != nil {
+			logger.Errorf("cannot generate IPv4 address: %v", err)
+			w.Redirect("/?error=addprofile")
+			return
+		}
+
+		ipv4Addr = v4.String()
+		logger.Debugf("generated IPv4 address: %v for profile %v", ipv4Addr, profile.ID)
+	}
+
+	var ipv6Addr string
+	if ipv6Enabled {
+		cidr := fmt.Sprintf("%s0/%s", ipv6Pref, ipv6Cidr)
+		ip, ipv6subnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			logger.Errorf("cannot parse IPv6 CIDR: %v", err)
+			w.Redirect("/?error=addprofile")
+			return
+		}
+
+		// Override the start IPv6 address with the one from the config.
+		// fd00::/64 --> fd00::10:97:0/64.
+		ipv6subnet.IP = ip
+
+		_, v6, err := generateIPAddr(nil, ipv6subnet, uint32(profile.Number))
+		if err != nil {
+			logger.Errorf("cannot generate IPv6 address: %v", err)
+			w.Redirect("/?error=addprofile")
+			return
+		}
+
+		ipv6Addr = v6.String()
+		logger.Debugf("generated IPv6 address: %v for profile %v", ipv6Addr, profile.ID)
+	}
+
 	script := `
 cd {{$.Datadir}}/wireguard
 wg_private_key="$(wg genkey)"
 wg_public_key="$(echo $wg_private_key | wg pubkey)"
 
-wg set wg0 peer ${wg_public_key} allowed-ips {{if .Ipv4Enabled}}{{$.IPv4Pref}}{{$.Profile.Number}}/32{{end}}{{if .Ipv6Enabled}}{{if .Ipv4Enabled}},{{end}}{{$.IPv6Pref}}{{$.Profile.Number}}/128{{end}}
+wg set wg0 peer ${wg_public_key} allowed-ips {{if .Ipv4Enabled}}{{$.IPv4Addr}}/32{{end}}{{if .Ipv6Enabled}}{{if .Ipv4Enabled}},{{end}}{{$.IPv6Addr}}/128{{end}}
 
 cat <<WGPEER >peers/{{$.Profile.ID}}.conf
 [Peer]
 PublicKey = ${wg_public_key}
-AllowedIPs = {{if .Ipv4Enabled}}{{$.IPv4Pref}}{{$.Profile.Number}}/32{{end}}{{if .Ipv6Enabled}}{{if .Ipv4Enabled}},{{end}}{{$.IPv6Pref}}{{$.Profile.Number}}/128{{end}}
+AllowedIPs = {{if .Ipv4Enabled}}{{$.IPv4Addr}}/32{{end}}{{if .Ipv6Enabled}}{{if .Ipv4Enabled}},{{end}}{{$.IPv6Addr}}/128{{end}}
 WGPEER
 
 cat <<WGCLIENT >clients/{{$.Profile.ID}}.conf
@@ -486,7 +536,7 @@ PrivateKey = ${wg_private_key}
 {{- if not .DisableDNS }}
 DNS = {{if .Ipv4Enabled}}{{$.IPv4Gw}}{{end}}{{if .Ipv6Enabled}}{{if .Ipv4Enabled}},{{end}}{{$.IPv6Gw}}{{end}}
 {{- end }}
-Address = {{if .Ipv4Enabled}}{{$.IPv4Pref}}{{$.Profile.Number}}/{{$.IPv4Cidr}}{{end}}{{if .Ipv6Enabled}}{{if .Ipv4Enabled}},{{end}}{{$.IPv6Pref}}{{$.Profile.Number}}/{{$.IPv6Cidr}}{{end}}
+Address = {{if .Ipv4Enabled}}{{$.IPv4Addr}}/{{$.IPv4Cidr}}{{end}}{{if .Ipv6Enabled}}{{if .Ipv4Enabled}},{{end}}{{$.IPv6Addr}}/{{$.IPv6Cidr}}{{end}}
 
 [Peer]
 PublicKey = $(cat server.public)
@@ -497,37 +547,37 @@ PersistentKeepalive = {{$.PersistentKeepalive}}
 WGCLIENT
 `
 	_, err = bash(script, struct {
-		Profile      		Profile
-		EndpointHost 		string
-		Datadir      		string
-		IPv4Gw       		string
-		IPv6Gw       		string
-		IPv4Pref     		string
-		IPv6Pref     		string
-		IPv4Cidr     		string
-		IPv6Cidr     		string
-		Listenport   		string
-		AllowedIPS   		string
-		Ipv4Enabled  		bool
-		Ipv6Enabled  		bool
-		DisableDNS   		bool
+		Profile             Profile
+		EndpointHost        string
+		Datadir             string
+		IPv4Gw              string
+		IPv6Gw              string
+		IPv4Addr            string
+		IPv6Addr            string
+		IPv4Cidr            string
+		IPv6Cidr            string
+		Listenport          string
+		AllowedIPS          string
+		Ipv4Enabled         bool
+		Ipv6Enabled         bool
+		DisableDNS          bool
 		PersistentKeepalive string
 	}{
-		profile,
-		endpointHost,
-		datadir,
-		ipv4Gw,
-		ipv6Gw,
-		ipv4Pref,
-		ipv6Pref,
-		ipv4Cidr,
-		ipv6Cidr,
-		listenport,
-		allowedips,
-		ipv4Enabled,
-		ipv6Enabled,
-		disableDNS,
-		persistentKeepalive,
+		Profile:             profile,
+		EndpointHost:        endpointHost,
+		Datadir:             datadir,
+		IPv4Gw:              ipv4Gw,
+		IPv6Gw:              ipv6Gw,
+		IPv4Addr:            ipv4Addr,
+		IPv6Addr:            ipv6Addr,
+		IPv4Cidr:            ipv4Cidr,
+		IPv6Cidr:            ipv6Cidr,
+		Listenport:          listenport,
+		AllowedIPS:          allowedips,
+		Ipv4Enabled:         ipv4Enabled,
+		Ipv6Enabled:         ipv6Enabled,
+		DisableDNS:          disableDNS,
+		PersistentKeepalive: persistentKeepalive,
 	})
 	if err != nil {
 		logger.Warn(err)
@@ -686,9 +736,7 @@ func helpHandler(w *Web) {
 	w.HTML()
 }
 
-//
 // Helpers
-//
 func deleteProfile(profile Profile) error {
 	script := `
 # WireGuard

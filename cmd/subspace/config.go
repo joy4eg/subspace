@@ -9,7 +9,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -97,12 +96,12 @@ type Config struct {
 func NewConfig(filename string) (*Config, error) {
 	filename = filepath.Join(datadir, filename)
 	c := &Config{filename: filename}
-	b, err := ioutil.ReadFile(filename)
+	b, err := os.ReadFile(filename)
 
 	// Create new config with defaults
 	if os.IsNotExist(err) {
 		c.Info = &Info{
-			Email: "null",
+			Email:    "null",
 			HashKey:  RandomString(32),
 			BlockKey: RandomString(32),
 		}
