@@ -5,17 +5,14 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"path"
 	"strings"
 	"text/template"
-	"time"
 
 	humanize "github.com/dustin/go-humanize"
+	"github.com/subspacecommunity/subspace/web"
 	gomail "gopkg.in/gomail.v2"
 )
-
-func init() {
-	rand.Seed(time.Now().Unix())
-}
 
 type Mailer struct{}
 
@@ -88,29 +85,35 @@ func (m *Mailer) Render(target string, data interface{}) (string, error) {
 	t := template.New(target).Funcs(template.FuncMap{
 		"time": humanize.Time,
 	})
-	for _, filename := range AssetNames() {
-		if !strings.HasPrefix(filename, "email/") {
-			continue
-		}
-		name := strings.TrimPrefix(filename, "email/")
-		b, err := Asset(filename)
+
+	logger.Debugf("rendering email template %s", target)
+
+	entries, err := web.Email.ReadDir("email")
+	if err != nil {
+		return "", err
+	}
+
+	for _, file := range entries {
+		b, err := web.Email.ReadFile(path.Join("email", file.Name()))
 		if err != nil {
 			return "", err
 		}
 
 		var tmpl *template.Template
-		if name == t.Name() {
+		if file.Name() == t.Name() {
 			tmpl = t
 		} else {
-			tmpl = t.New(name)
+			tmpl = t.New(file.Name())
 		}
 		if _, err := tmpl.Parse(string(b)); err != nil {
 			return "", err
 		}
 	}
+
 	var b bytes.Buffer
 	if err := t.Execute(&b, data); err != nil {
 		return "", err
 	}
+
 	return b.String(), nil
 }

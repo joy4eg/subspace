@@ -5,9 +5,11 @@ import (
 	"encoding/gob"
 	"fmt"
 	"html/template"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -16,9 +18,13 @@ import (
 	"github.com/pquerna/otp"
 
 	"golang.org/x/net/publicsuffix"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 
 	humanize "github.com/dustin/go-humanize"
 	httprouter "github.com/julienschmidt/httprouter"
+
+	"github.com/subspacecommunity/subspace/web"
 )
 
 var (
@@ -74,7 +80,32 @@ func Error(w http.ResponseWriter, err error) {
 	fmt.Fprintf(w, errorPageHTML+"\n")
 }
 
+func readAllWebTemplates(subfolder string) (templates []string) {
+	var target = "templates"
+
+	if subfolder != "" {
+		target = path.Join(target, subfolder)
+	}
+
+	entries, err := web.Templates.ReadDir(target)
+	if err != nil {
+		logger.Error(err)
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			templates = append(templates, readAllWebTemplates(path.Join(subfolder, entry.Name()))...)
+		} else {
+			templates = append(templates, path.Join(target, entry.Name()))
+		}
+	}
+
+	return
+}
+
 func (w *Web) HTML() {
+	logger.Debugf("web: running template: %s", w.template)
 	t := template.New(w.template).Funcs(template.FuncMap{
 		"hasprefix": strings.HasPrefix,
 		"hassuffix": strings.HasSuffix,
@@ -106,16 +137,13 @@ func (w *Web) HTML() {
 			if icann {
 				suffix = "." + suffix
 			}
-			return strings.Title(strings.TrimSuffix(domain, suffix))
+			return cases.Title(language.English).String(strings.TrimSuffix(domain, suffix))
 		},
 	})
 
-	for _, filename := range AssetNames() {
-		if !strings.HasPrefix(filename, "templates/") {
-			continue
-		}
+	for _, filename := range readAllWebTemplates("") {
 		name := strings.TrimPrefix(filename, "templates/")
-		b, err := Asset(filename)
+		b, err := web.Templates.ReadFile(filename)
 		if err != nil {
 			Error(w.w, err)
 			return
@@ -134,6 +162,7 @@ func (w *Web) HTML() {
 	}
 
 	w.w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
 	if err := t.Execute(w.w, w); err != nil {
 		Error(w.w, err)
 		return
@@ -204,7 +233,7 @@ func WebHandler(h func(*Web), section string) httprouter.Handle {
 				jwtSessionClaims, ok := session.(samlsp.JWTSessionClaims)
 
 				if !ok {
-					Error(w, fmt.Errorf("Unable to decode session into JWTSessionClaims"))
+					Error(w, fmt.Errorf("unable to decode session into JWTSessionClaims"))
 					return
 				}
 
@@ -266,19 +295,30 @@ func staticHandler(w http.ResponseWriter, r *http.Request, ps httprouter.Params)
 }
 
 func serveAsset(w http.ResponseWriter, r *http.Request, filename string) {
-	path := "static" + filename
+	var modTime time.Time
 
-	b, err := Asset(path)
+	b, err := web.Static.Open(path.Join("static", filename))
 	if err != nil {
+		logger.Debugf("static open: %s: %s", filename, err)
 		http.NotFound(w, r)
 		return
 	}
-	fi, err := AssetInfo(path)
+
+	stat, err := b.Stat()
+	if err != nil {
+		logger.Error(err)
+		modTime = time.Now()
+	} else {
+		modTime = stat.ModTime()
+	}
+
+	fi, err := io.ReadAll(b)
 	if err != nil {
 		Error(w, err)
 		return
 	}
-	http.ServeContent(w, r, path, fi.ModTime(), bytes.NewReader(b))
+
+	http.ServeContent(w, r, filename, modTime, bytes.NewReader(fi))
 }
 
 func ValidateSession(r *http.Request) (*Session, error) {
